@@ -1,0 +1,297 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{enumitem}
+\usepackage{authblk}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\title{\bf CoRT: Coupled Routing Transformers for Unified Sparse Attention and Sparse Experts\\
+\large A Theoretical Architecture for Compute-Context-Capacity Scaling in Large Language Models}
+
+\author[1]{Ankit Kumar Jawla\thanks{Draft for academic submission. Replace author/affiliation as needed.}}
+\affil[1]{Independent Researcher (or Capgemini / Barclays engagement, if appropriate for disclosure rules)}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Large Language Models (LLMs) face a persistent tri-lemma: (i) \emph{long-context inference} requires sub-quadratic attention, (ii) \emph{high capacity} benefits from sparse Mixture-of-Experts (MoE), and (iii) \emph{stable training} demands predictable routing and balanced utilization. Existing approaches typically address these axes in isolation: sparse attention restricts token-to-token interactions, MoE sparsifies the MLP block, and separate routers introduce mismatched inductive biases, instabilities, and redundant control overhead.
+
+We propose \textbf{CoRT} (\textbf{Co}upled \textbf{R}outing \textbf{T}ransformers), a new architecture that \emph{couples} attention sparsification and expert selection through a single entropy-regularized router that assigns each token to a small set of \emph{route codes}. A route code simultaneously determines (a) an \emph{attention neighborhood} (content-based + locality-biased) and (b) a \emph{compute pathway} via expert MLP selection. CoRT yields a unified objective that trades off (1) global information flow, (2) per-token compute, and (3) per-layer communication.
+
+We provide: (i) a compute/memory complexity analysis showing CoRT interpolates between dense Transformers and efficient long-context models; (ii) an approximation theorem stating that CoRT approximates dense softmax attention under a mild \emph{clusterable-kernel} assumption; (iii) a load-balance theorem bounding per-expert overload probability under entropy-regularized routing; and (iv) an expressivity result showing CoRT strictly generalizes standard Transformers as a special case. We conclude with an experimental protocol and ablation plan for validating CoRT on long-context language modeling and retrieval-intensive tasks.
+\end{abstract}
+
+\section{Introduction}
+Transformer-based LLMs have achieved remarkable capabilities through scale \cite{vaswani2017attention,brown2020gpt3,chowdhery2022palm}, yet two structural bottlenecks remain central.
+
+\textbf{(1) Context length bottleneck.} Full self-attention scales as $O(n^2)$ in sequence length $n$, motivating sparse attention patterns (Longformer, BigBird, Reformer, Routing Transformer, Performer/Linformer variants) \cite{beltagy2020longformer,zaheer2020bigbird,kitaev2020reformer,roy2020routing,choromanski2021performer,wang2020linformer,dao2022flashattention}.
+
+\textbf{(2) Capacity bottleneck.} Scaling parameters without scaling FLOPs has been enabled by conditional computation with sparse MoE layers \cite{shazeer2017moe,fedus2021switch,du2022glam}. However, routing can be unstable and imbalanced, and MoE alone does not solve long-context attention.
+
+\textbf{Thesis.} We argue these are \emph{not independent}: the model’s attention graph determines which tokens exchange information, while MoE routing determines which parameters process token states. If these are governed by separate routers (or unrelated inductive biases), the model can waste capacity on tokens that never exchange information, or exchange information among tokens processed by incompatible compute pathways, increasing variance and harming training stability.
+
+\textbf{Contribution.} CoRT introduces \emph{coupled routing}: a single router produces discrete \emph{route codes} that simultaneously define sparse attention neighborhoods \emph{and} expert pathways. The router is trained with (i) entropy control, (ii) load balancing, and (iii) a novel \emph{coupling regularizer} that aligns neighborhood structure with compute specialization.
+
+\paragraph{What is “new” here?}
+CoRT is not simply “MoE + sparse attention.” The novelty is a \emph{single, shared control variable} that induces:
+\begin{itemize}[leftmargin=*]
+\item a \emph{coherent sparse interaction graph} (who can talk to whom),
+\item a \emph{coherent sparse compute graph} (which parameters process whom),
+\item and a \emph{joint regularized objective} with provable load and approximation properties.
+\end{itemize}
+
+\section{Related Work}
+\paragraph{Dense Transformers and scaling.}
+Transformers \cite{vaswani2017attention} and large-scale training \cite{brown2020gpt3,chowdhery2022palm} underpin modern LLMs.
+
+\paragraph{Efficient attention for long context.}
+Sparse/local/global patterns (Longformer, BigBird) \cite{beltagy2020longformer,zaheer2020bigbird}, hashing/clustering attention (Reformer, Routing Transformer) \cite{kitaev2020reformer,roy2020routing}, low-rank and random feature approximations (Linformer, Performer) \cite{wang2020linformer,choromanski2021performer}, and IO-aware kernels (FlashAttention) \cite{dao2022flashattention} improve feasibility for long sequences.
+
+\paragraph{Sparse experts (MoE).}
+Conditional computation with MoE \cite{shazeer2017moe} and simplified routing (Switch) \cite{fedus2021switch} enable scaling parameters with relatively constant per-token compute, as in GLaM \cite{du2022glam}. However, routing collapse and expert imbalance remain recurring issues.
+
+\paragraph{Positional generalization.}
+Methods like Transformer-XL \cite{dai2019transformerxl}, ALiBi \cite{press2021alibi}, and RoPE \cite{su2021roformer} address extrapolation and long-range structure; CoRT is compatible with these.
+
+\paragraph{Expressivity theory.}
+Transformers are universal approximators under standard assumptions \cite{yun2019universal}, and sparse Transformers can preserve universality under certain patterns \cite{zaheer2020bigbird,yun2020sparseuniversal}. CoRT leverages and extends these insights.
+
+\section{CoRT Architecture}
+
+\subsection{Preliminaries}
+Let $X \in \mathbb{R}^{n \times d}$ be token representations at a given layer. Standard Transformer layers compute
+\[
+\mathrm{Attn}(X) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}} + B\right)V,
+\quad Q=XW_Q,\;K=XW_K,\;V=XW_V,
+\]
+followed by an MLP block. CoRT modifies both attention \emph{and} MLP via a shared router.
+
+\subsection{Route Codes and Coupled Routing}
+CoRT introduces $M$ discrete \emph{route codes} $\{1,\dots,M\}$. For each token $i$, a router produces a distribution
+\[
+p_\theta(z_i \!=\! m \mid x_i) = \mathrm{softmax}(r_\theta(x_i))_m,
+\]
+where $r_\theta:\mathbb{R}^d \to \mathbb{R}^M$. Each token selects a \emph{small} set of codes, typically top-$k$ with $k\in\{1,2\}$ (Switch-style). We write $\hat{z}_i$ for the selected code(s).
+
+\paragraph{Coupling principle.}
+A route code controls:
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Attention neighborhood.} Token $i$ attends primarily to tokens $j$ with shared code $\hat{z}_j=\hat{z}_i$ (plus a small set of global/memory tokens).
+\item \textbf{Expert pathway.} Token $i$ is processed by an expert MLP $E_{\pi(\hat{z}_i)}$ (or mixture across top-$k$).
+\end{enumerate}
+Thus, tokens that “talk” to each other are preferentially processed by compatible compute pathways.
+
+\subsection{Coupled Sparse Attention}
+Define the sparse adjacency:
+\[
+A_{ij} = \mathbf{1}\{\hat{z}_i=\hat{z}_j\}\cdot \mathbf{1}\{|i-j|\le w\} \;\;\vee\;\; \mathbf{1}\{j \in \mathcal{G}\},
+\]
+where $w$ is a locality window and $\mathcal{G}$ is a small set of global tokens (as in BigBird/Longformer-style hybrids \cite{beltagy2020longformer,zaheer2020bigbird}). CoRT attention is:
+\[
+\mathrm{CoAttn}(X)_i
+=
+\sum_{j: A_{ij}=1}
+\alpha_{ij} V_j,\quad
+\alpha_{ij} \propto \exp\!\left(\frac{\langle Q_i,K_j\rangle}{\sqrt{d_k}} + b(i,j)\right),
+\]
+where $b(i,j)$ can incorporate ALiBi/RoPE-compatible biases \cite{press2021alibi,su2021roformer}. The key is that the candidate set is \emph{route-consistent}.
+
+\subsection{Coupled MoE MLP}
+Let $\{E_e(\cdot)\}_{e=1}^E$ be expert MLPs. CoRT assigns an expert using a fixed mapping $\pi:\{1,\dots,M\}\to\{1,\dots,E\}$ (learnable or deterministic). The MLP output is:
+\[
+\mathrm{CoMLP}(x_i) = E_{\pi(\hat{z}_i)}(x_i)
+\quad\text{(top-1)}
+\]
+or a sparse mixture for top-$k$ routing \cite{shazeer2017moe,fedus2021switch}.
+
+\subsection{Training Objective}
+Let $\mathcal{L}_{\text{task}}$ be the standard next-token prediction loss. CoRT adds:
+\[
+\mathcal{L} = \mathcal{L}_{\text{task}}
++ \lambda_{\text{lb}}\mathcal{L}_{\text{lb}}
++ \lambda_{\text{ent}}\mathcal{L}_{\text{ent}}
++ \lambda_{\text{cpl}}\mathcal{L}_{\text{cpl}}.
+\]
+
+\paragraph{Load balancing.}
+We use a Switch-style auxiliary loss to encourage uniform utilization \cite{fedus2021switch}:
+\[
+\mathcal{L}_{\text{lb}} = E\sum_{e=1}^E
+\left(\bar{p}_e - \frac{1}{E}\right)^2,
+\quad
+\bar{p}_e = \frac{1}{n}\sum_{i=1}^n \Pr(\pi(z_i)=e).
+\]
+
+\paragraph{Entropy control.}
+To avoid routing collapse and to maintain exploration:
+\[
+\mathcal{L}_{\text{ent}} = -\frac{1}{n}\sum_{i=1}^n H(p_\theta(\cdot\mid x_i)).
+\]
+
+\paragraph{Coupling regularizer (new).}
+We encourage \emph{neighborhood coherence} with compute specialization by aligning token similarity neighborhoods with route consistency:
+\[
+\mathcal{L}_{\text{cpl}} =
+\frac{1}{n}\sum_{i=1}^n
+\mathrm{KL}\big(\,s_i(\cdot)\;\|\;p_\theta(\cdot\mid x_i)\big),
+\]
+where $s_i$ is a \emph{soft target distribution} over codes derived from a kernelized similarity of $x_i$ to a small anchor set (or from online clustering statistics). Intuitively: tokens with similar representations are encouraged to share route codes, ensuring that sparse attention edges and expert pathways co-evolve rather than conflict.
+
+\section{Complexity Analysis}
+Let $n$ be sequence length, $d$ hidden size, $h$ heads, window $w$, and average bucket size $b$ induced by routing (expected tokens per code). Candidate neighbors per token are $O(w + b + |\mathcal{G}|)$.
+
+\paragraph{Attention.}
+Per layer time:
+\[
+T_{\text{attn}} = O\big(nh(d_k)(w + b + |\mathcal{G}|)\big),
+\]
+vs.\ dense $O(n^2)$. Memory similarly scales with candidate edges.
+
+\paragraph{MoE.}
+With top-1 routing, per token MLP cost is $O(d d_{\text{ff}})$ but only for one expert. Total is $O(n d d_{\text{ff}})$ compute, with parameter capacity $O(E d d_{\text{ff}})$.
+
+\paragraph{Interpolation.}
+CoRT recovers:
+\begin{itemize}[leftmargin=*]
+\item Dense Transformer when $M=1$ and $b=n$ (full bucket), $|\mathcal{G}|=0$, $w=n$.
+\item Sparse attention without MoE when $E=1$.
+\item Switch-like MoE without sparse attention when adjacency ignores codes.
+\end{itemize}
+
+\section{Theory}
+
+\subsection{Expressivity: CoRT Generalizes Dense Transformers}
+\begin{theorem}[Containment of Dense Transformers]
+For any standard Transformer layer $\mathcal{T}$ with softmax attention and dense MLP, there exists a CoRT layer $\mathcal{C}$ such that $\mathcal{C}(X)=\mathcal{T}(X)$ for all $X$ (up to numerical precision).
+\end{theorem}
+\begin{proof}
+Set $M=1$ so all tokens share the same route code, choose $w=n$ and $\mathcal{G}=\emptyset$, making attention fully dense. Set $E=1$ (single expert) so the MoE reduces to a dense MLP. Then CoRT operations coincide with standard attention and MLP.
+\end{proof}
+
+\subsection{Approximation of Dense Attention Under Clusterable Kernels}
+We formalize when routing-based sparsification approximates full attention.
+
+\paragraph{Assumption (Clusterable attention kernel).}
+For each query token $i$, there exists a partition of tokens into $M$ clusters such that the attention mass concentrates on the in-cluster tokens plus a small global set. Formally, for the dense attention weights $\alpha^{\star}_{ij}$,
+\[
+\sum_{j \notin \mathcal{N}(i)} \alpha^{\star}_{ij} \le \varepsilon,
+\]
+where $\mathcal{N}(i)$ contains tokens in the same cluster as $i$ plus $|\mathcal{G}|$ global tokens.
+
+\begin{theorem}[Sparse CoRT Attention Approximation]
+Under the clusterable-kernel assumption, CoRT attention with perfect routing to the inducing clusters satisfies
+\[
+\|\mathrm{CoAttn}(X) - \mathrm{Attn}(X)\|_{\infty} \le 2\varepsilon \cdot \|V\|_{\infty}.
+\]
+\end{theorem}
+\begin{proof}
+Let $\alpha^{\star}_{ij}$ be dense attention weights and $\tilde{\alpha}_{ij}$ CoRT weights with support restricted to $\mathcal{N}(i)$. The missing mass outside $\mathcal{N}(i)$ is at most $\varepsilon$. Renormalization changes in-support weights by at most a factor $1/(1-\varepsilon)$, so the total deviation in the convex combination is bounded by at most $2\varepsilon$ times the maximum value magnitude (standard truncation + renormalization argument).
+\end{proof}
+
+\paragraph{Discussion.}
+This theorem isolates the key question: can the router discover a partition where attention mass is mostly intra-bucket? CoRT’s coupling loss explicitly pressures representation geometry and routing to co-adapt to satisfy this assumption.
+
+\subsection{Load-Balance Guarantees Under Entropy-Regularized Routing}
+Let $L_e$ be the number of tokens assigned to expert $e$ in a batch of size $n$. Assume top-1 sampling from router distribution with expected per-token expert probabilities $\bar{p}_e$.
+
+\begin{theorem}[Overload probability bound]
+If $\max_e \bar{p}_e \le \frac{1}{E} + \delta$ and token routes are conditionally independent given representations,\footnote{This is a standard approximation for concentration analysis; practical routing introduces mild dependence.}
+then for any $\eta>0$,
+\[
+\Pr\!\left[L_e \ge n\!\left(\frac{1}{E}+\delta+\eta\right)\right]
+\le \exp\!\big(-2n\eta^2\big).
+\]
+\end{theorem}
+\begin{proof}
+$L_e=\sum_{i=1}^n \mathbf{1}\{\pi(\hat{z}_i)=e\}$ is a sum of Bernoulli variables with mean at most $n(\frac{1}{E}+\delta)$. Apply Hoeffding’s inequality.
+\end{proof}
+
+\paragraph{Role of entropy and load balancing.}
+The auxiliary losses $\mathcal{L}_{\text{ent}}$ and $\mathcal{L}_{\text{lb}}$ explicitly push $\bar{p}_e \to 1/E$ (small $\delta$) and prevent collapse, yielding predictable compute and reduced all-to-all communication variance.
+
+\section{Implementation Notes and Experimental Protocol (for Submission)}
+This section outlines how to validate CoRT empirically in a publishable study.
+
+\subsection{Model Variants}
+\begin{itemize}[leftmargin=*]
+\item \textbf{CoRT-Base}: $M=256$ route codes, $E=64$ experts, top-1 routing, window $w=256$, $|\mathcal{G}|=16$.
+\item \textbf{Ablations}:
+(i) decouple routing (separate routers for attention and experts),
+(ii) remove coupling loss,
+(iii) remove entropy term,
+(iv) vary $M$ and $E$.
+\end{itemize}
+
+\subsection{Baselines}
+Dense Transformer \cite{vaswani2017attention}, Longformer/BigBird-style sparse attention \cite{beltagy2020longformer,zaheer2020bigbird}, Reformer/Routing Transformer \cite{kitaev2020reformer,roy2020routing}, Performer/Linformer \cite{choromanski2021performer,wang2020linformer}, Switch/GLaM-style MoE \cite{fedus2021switch,du2022glam}, and IO-optimized attention implementations where applicable \cite{dao2022flashattention}.
+
+\subsection{Tasks}
+\begin{itemize}[leftmargin=*]
+\item Long-context language modeling: PG-19 / long-document corpora.
+\item Retrieval-intensive modeling: RETRO-style comparisons \cite{borgeaud2022retro}.
+\item Length extrapolation: train short/test long (optionally ALiBi/RoPE) \cite{press2021alibi,su2021roformer}.
+\end{itemize}
+
+\subsection{Metrics}
+Perplexity vs.\ context length, wall-clock throughput, memory footprint, routing entropy, expert utilization Gini coefficient, and stability indicators (router collapse rate, overflow frequency).
+
+\section{Limitations and Open Questions}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Router dependence.} Theoretical concentration assumes conditional independence; future work should model dependence induced by top-$k$ selection and token correlations.
+\item \textbf{Partition learnability.} The approximation theorem depends on existence of clusterable attention mass; characterizing when natural language satisfies this at scale is open.
+\item \textbf{Hardware mapping.} Real efficiency depends on kernel implementations and communication patterns; CoRT is designed to align with expert parallelism, but empirical validation is required.
+\end{itemize}
+
+\section{Conclusion}
+CoRT proposes a unified architectural principle for LLM scaling: \emph{couple who talks to whom with which parameters process whom}. This yields a coherent sparse interaction graph and sparse compute graph controlled by a single router, with theoretical guarantees for approximation and load balancing and a clear experimental path for validation.
+
+\paragraph{Figure note.} Figure~\ref{fig:ui} is included as a placeholder for your provided UI snapshot stored at \texttt{images/themes/homepage-light.png} in this repository.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{images/themes/homepage-light.png}
+  \caption{Prototype UI snapshot (provided by author repository).}
+  \label{fig:ui}
+\end{figure}
+
+\bibliographystyle{unsrt}
+\bibliography{references}
+
+\appendix
+\section{Appendix: Pseudocode (Reference Implementation Sketch)}
+\subsection{Coupled routing and attention}
+\begin{verbatim}
+Inputs: token states X in R^{n x d}
+Router logits: R = r_theta(X) in R^{n x M}
+Route probs: P = softmax(R)  # per-token distribution over route codes
+Codes: z_hat = top1(P)       # or topk
+
+Adjacency:
+  for token i:
+    candidates = tokens j with z_hat[j]==z_hat[i] and |i-j|<=w
+    candidates += global tokens G
+
+Compute attention only over candidates.
+Compute MoE MLP using expert pi(z_hat[i]).
+\end{verbatim}
+
+\section{Appendix: Notes on Theoretical Assumptions}
+The clusterable-kernel assumption is satisfied when attention is dominated by a small number of topical segments or discourse-local regions plus a limited set of global summary tokens. The coupling term is intended to encourage such geometry to emerge during training, by aligning router partitions with representational similarity.
+
+\end{document}
